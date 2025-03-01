@@ -307,7 +307,7 @@ fi
 
 # Set up LVM
 log "Setting up LVM..."
-pvcreate "$lvm_part"
+pvcreate -ff "$lvm_part"
 check_success "Failed to create physical volume"
 
 vgcreate vg_system "$lvm_part"
