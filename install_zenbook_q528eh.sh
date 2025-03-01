@@ -124,6 +124,94 @@ if [ "$confirm" != "y" ]; then
   exit 0
 fi
 
+# NEW: Comprehensive pre-installation disk cleanup
+log "Starting comprehensive disk cleanup..."
+log "This will completely wipe all data, partitions, and metadata from $dev"
+read -p "Continue with aggressive disk cleanup? (y/n): " cleanup_confirm
+if [ "$cleanup_confirm" = "y" ]; then
+  log "Performing aggressive disk cleanup..."
+  
+  # Kill all processes that might be using the disk
+  log "Terminating processes that might be using the disk..."
+  fuser -km "${dev}"* 2>/dev/null || true
+  
+  # Unmount any mounted partitions
+  log "Unmounting all partitions..."
+  umount -f "${dev}"* 2>/dev/null || true
+  
+  # Deactivate any LVM on the disk
+  log "Deactivating LVM volumes..."
+  if command -v vgchange &> /dev/null; then
+    # Find any volume groups on this device
+    potential_vgs=$(pvs --noheadings -o vg_name "${dev}"* 2>/dev/null | tr -d ' ' || true)
+    if [ -n "$potential_vgs" ]; then
+      for vg in $potential_vgs; do
+        log "Deactivating volume group: $vg"
+        vgchange -an "$vg" || true
+      done
+    fi
+    
+    # Remove any LVM metadata from all partitions
+    log "Removing LVM metadata from partitions..."
+    for part in $(lsblk -nlo NAME "$dev" | grep -v "$(basename "$dev")$"); do
+      log "Checking for LVM on /dev/$part"
+      pvremove -ff -y "/dev/$part" 2>/dev/null || true
+    done
+  fi
+  
+  # Close any LUKS containers
+  log "Closing any LUKS containers..."
+  if command -v cryptsetup &> /dev/null; then
+    for part in $(lsblk -nlo NAME "$dev" | grep -v "$(basename "$dev")$"); do
+      cryptsetup close "/dev/$part" 2>/dev/null || true
+    done
+  fi
+  
+  # Wipe all signatures from the disk and partitions
+  log "Wiping all signatures from disk and partitions..."
+  log "Wiping main disk: $dev"
+  wipefs -a "$dev" || log "Warning: Failed to wipe signatures from $dev"
+  
+  # Wipe all existing partitions
+  for part in $(ls ${dev}* 2>/dev/null | grep -v "^$dev$"); do
+    log "Wiping partition: $part"
+    wipefs -a "$part" 2>/dev/null || true
+  done
+  
+  # Zero out the first and last few MB of the disk
+  log "Zero-ing out the beginning and end of disk..."
+  dd if=/dev/zero of="$dev" bs=1M count=10 conv=fsync || log "Warning: Failed to zero beginning of disk"
+  
+  # Calculate disk size in 512-byte sectors
+  local_disk_size=$(blockdev --getsz "$dev")
+  if [ $? -eq 0 ] && [ "$local_disk_size" -gt 20000 ]; then
+    # Zero out the last 10MB
+    seek_val=$((local_disk_size/2048 - 10))
+    dd if=/dev/zero of="$dev" bs=1M count=10 seek=$seek_val conv=fsync || log "Warning: Failed to zero end of disk"
+  fi
+  
+  # Create new empty partition table (will be recreated later in the script)
+  log "Creating empty partition table..."
+  parted -s "$dev" mklabel gpt || log "Warning: Failed to create empty partition table"
+  
+  # Use gdisk to perform a deeper clean if available
+  if command -v gdisk &> /dev/null; then
+    log "Using gdisk to perform deeper cleanup..."
+    echo -e "x\nz\ny\ny" | gdisk "$dev" || log "Warning: gdisk cleanup failed"
+  fi
+  
+  # Final sync to ensure all writes are completed
+  log "Syncing disk..."
+  sync
+  sleep 3
+  
+  log "Aggressive disk cleanup completed."
+  log "Waiting for system to recognize changes..."
+  sleep 5
+else
+  log "Skipping aggressive cleanup. Installation may fail if disk has issues."
+fi
+
 # Prompt for username, hostname and passwords
 read -p "Enter your username: " username
 
@@ -358,29 +446,111 @@ fi
 
 # Set up LVM
 log "Setting up LVM..."
+
+# First attempt with standard methods
+log "Attempting to create physical volume with pvcreate -ff..."
 pvcreate -ff "$lvm_part"
 if [ $? -ne 0 ]; then
   log "ERROR: Failed to create physical volume using pvcreate -ff"
-  log "Manual intervention required:"
-  log "Try the following commands manually:"
-  log "1. wipefs -a $lvm_part"
-  log "2. pvcreate -ff $lvm_part"
-  log "3. If successful, continue the script; otherwise reboot and try again"
+  log "Attempting automatic recovery..."
   
-  read -p "Would you like to run these commands now? (y/n): " run_manual
-  if [ "$run_manual" = "y" ]; then
-    log "Running wipefs to clean partition..."
-    wipefs -a "$lvm_part"
-    log "Retrying pvcreate with force flag..."
-    pvcreate -ff "$lvm_part"
-    if [ $? -ne 0 ]; then
-      log "Manual commands failed. You may need to restart the system."
-      read -p "Press Enter to continue or Ctrl+C to abort..."
+  # Try cleaning the partition more thoroughly
+  log "Cleaning partition more thoroughly..."
+  dd if=/dev/zero of="$lvm_part" bs=1M count=10 || log "Warning: Failed to zero beginning of partition"
+  wipefs -a "$lvm_part" || log "Warning: Failed to wipe signatures"
+  
+  # Try creating PV again
+  log "Retrying pvcreate with force flag..."
+  pvcreate -ff "$lvm_part"
+  
+  if [ $? -ne 0 ]; then
+    log "Automatic recovery failed."
+    log "-----------------------------------------------------"
+    log "EMERGENCY RECOVERY OPTION:"
+    log "This will completely recreate the partition from scratch."
+    log "WARNING: This is a potentially dangerous operation."
+    log "-----------------------------------------------------"
+    read -p "Attempt emergency partition recreation? (y/n): " emergency
+    
+    if [ "$emergency" = "y" ]; then
+      log "Starting emergency partition recreation..."
+      
+      # Unmount and close everything again
+      umount -f "${dev}"* 2>/dev/null || true
+      
+      # Attempt to deactivate any existing LVM
+      vgchange -an 2>/dev/null || true
+      
+      # Destroy the partition and recreate it
+      log "Deleting partition 3..."
+      parted -s "$dev" rm 3 || log "Warning: Failed to delete partition 3"
+      
+      # Make sure the partition table is reloaded
+      partprobe "$dev" || true
+      sleep 2
+      
+      # Recreate the partition
+      log "Recreating LVM partition..."
+      if $is_uefi; then
+        parted -s "$dev" mkpart "lvm" ext4 "$((513 + $swap_size))MiB" 100%
+      else
+        parted -s "$dev" mkpart "lvm" ext4 "$((3 + $swap_size))MiB" 100%
+      fi
+      
+      # Extra aggressive steps to ensure partition table is reloaded
+      sync
+      partprobe "$dev" || true
+      udevadm settle
+      sleep 10
+      
+      # Try all the methods to make the kernel recognize the new partition
+      hdparm -z "$dev" 2>/dev/null || true
+      blockdev --rereadpt "$dev" 2>/dev/null || true
+      
+      # Print current partition info for debugging
+      log "Current partition information:"
+      lsblk "$dev"
+      
+      # Try creating PV again on the newly created partition
+      log "Attempting pvcreate on recreated partition..."
+      pvcreate -ff "$lvm_part"
+      
+      if [ $? -ne 0 ]; then
+        log "CRITICAL ERROR: All recovery methods failed."
+        log "Manual intervention required:"
+        log "You may need to reboot and start the installation again."
+        log "After reboot, you might want to run 'dd if=/dev/zero of=$dev bs=1M count=100' to wipe the beginning of the disk completely before retrying."
+        read -p "Press Enter to continue or Ctrl+C to abort..."
+      else
+        log "Emergency recovery successful. Continuing with volume group creation."
+      fi
     else
-      log "Manual intervention successful. Continuing installation."
+      log "Emergency recovery skipped. Continuing with standard options..."
+      
+      log "Manual intervention required:"
+      log "Try the following commands manually:"
+      log "1. wipefs -a $lvm_part"
+      log "2. pvcreate -ff $lvm_part"
+      log "3. If successful, continue the script; otherwise reboot and try again"
+      
+      read -p "Would you like to run these commands now? (y/n): " run_manual
+      if [ "$run_manual" = "y" ]; then
+        log "Running wipefs to clean partition..."
+        wipefs -a "$lvm_part"
+        log "Retrying pvcreate with force flag..."
+        pvcreate -ff "$lvm_part"
+        if [ $? -ne 0 ]; then
+          log "Manual commands failed. You may need to restart the system."
+          read -p "Press Enter to continue or Ctrl+C to abort..."
+        else
+          log "Manual intervention successful. Continuing installation."
+        fi
+      else
+        read -p "Press Enter to continue anyway (may fail) or Ctrl+C to abort..."
+      fi
     fi
   else
-    read -p "Press Enter to continue anyway (may fail) or Ctrl+C to abort..."
+    log "Automatic recovery successful. Continuing installation."
   fi
 fi
 check_success "Failed to create physical volume"
