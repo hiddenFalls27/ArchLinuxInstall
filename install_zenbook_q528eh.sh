@@ -264,18 +264,69 @@ if ! partprobe "$dev"; then
   udevadm settle
   
   log "Trying sysfs to trigger partition table reload..."
-  echo 1 > /sys/block/${dev##*/}/device/rescan
+  if [[ "$dev" == *"nvme"* ]]; then
+    device_name=$(basename "$dev")
+    echo 1 > /sys/block/${device_name}/device/rescan 2>/dev/null || true
+  else
+    device_name=$(basename "$dev")
+    echo 1 > /sys/block/${device_name}/device/rescan 2>/dev/null || true
+  fi
+  
+  # Additional methods to force kernel to reload the partition table
+  log "Trying additional methods to force partition table reload..."
+  
+  # Force a kernel partition table re-read with hdparm
+  if command -v hdparm &> /dev/null; then
+    log "Using hdparm to force partition table re-read..."
+    hdparm -z "$dev" || log "hdparm failed, continuing with other methods"
+  fi
+  
+  # Try using blockdev to reread the partition table
+  if command -v blockdev &> /dev/null; then
+    log "Using blockdev to force partition table re-read..."
+    blockdev --rereadpt "$dev" || log "blockdev --rereadpt failed, continuing with other methods"
+  fi
+  
+  # Force reread using direct kernel interface
+  log "Forcing partition table re-read through kernel interface..."
+  echo "w" | fdisk "$dev" >/dev/null 2>&1 || true
+  
+  # Last resort - try to manually detach and reattach the device (dangerous, only for NVMe)
+  if [[ "$dev" == *"nvme"* ]] && [ -f "/sys/block/${device_name}/device/delete" ]; then
+    log "WARNING: Attempting to detach and rescan NVMe device as last resort..."
+    read -p "This is a potentially dangerous operation. Continue? (y/n): " confirm
+    if [ "$confirm" = "y" ]; then
+      echo 1 > /sys/block/${device_name}/device/delete
+      sleep 2
+      echo 1 > /sys/devices/pci*/*/rescan
+      sleep 5
+    fi
+  fi
   
   log "Waiting for partitions to be recognized..."
-  sleep 5
+  sleep 10
   
-  # Check if partitions exist
-  if [[ $is_uefi == true && ! -b "$efi_part" ]]; then
-    log "Warning: EFI partition $efi_part not recognized by kernel"
-    log "Will attempt to continue anyway..."
-  elif [[ $is_uefi == false && ! -b "$bios_part" ]]; then
-    log "Warning: BIOS boot partition $bios_part not recognized by kernel"
-    log "Will attempt to continue anyway..."
+  # Check if partitions exist after all attempts
+  if $is_uefi; then
+    if [[ "$dev" == *"nvme"* ]]; then
+      if [ ! -b "${dev}p1" ] || [ ! -b "${dev}p2" ] || [ ! -b "${dev}p3" ]; then
+        log "ERROR: Partitions still not recognized after multiple attempts."
+        log "Manual intervention required:"
+        log "1. Run 'partprobe $dev'"
+        log "2. Check 'lsblk' to verify partitions are visible"
+        log "3. If necessary, reboot and restart the installation"
+        read -p "Press Enter to continue anyway (may fail) or Ctrl+C to abort..."
+      fi
+    else
+      if [ ! -b "${dev}1" ] || [ ! -b "${dev}2" ] || [ ! -b "${dev}3" ]; then
+        log "ERROR: Partitions still not recognized after multiple attempts."
+        log "Manual intervention required:"
+        log "1. Run 'partprobe $dev'"
+        log "2. Check 'lsblk' to verify partitions are visible" 
+        log "3. If necessary, reboot and restart the installation"
+        read -p "Press Enter to continue anyway (may fail) or Ctrl+C to abort..."
+      fi
+    fi
   fi
 fi
 
@@ -308,9 +359,65 @@ fi
 # Set up LVM
 log "Setting up LVM..."
 pvcreate -ff "$lvm_part"
+if [ $? -ne 0 ]; then
+  log "ERROR: Failed to create physical volume using pvcreate -ff"
+  log "Manual intervention required:"
+  log "Try the following commands manually:"
+  log "1. wipefs -a $lvm_part"
+  log "2. pvcreate -ff $lvm_part"
+  log "3. If successful, continue the script; otherwise reboot and try again"
+  
+  read -p "Would you like to run these commands now? (y/n): " run_manual
+  if [ "$run_manual" = "y" ]; then
+    log "Running wipefs to clean partition..."
+    wipefs -a "$lvm_part"
+    log "Retrying pvcreate with force flag..."
+    pvcreate -ff "$lvm_part"
+    if [ $? -ne 0 ]; then
+      log "Manual commands failed. You may need to restart the system."
+      read -p "Press Enter to continue or Ctrl+C to abort..."
+    else
+      log "Manual intervention successful. Continuing installation."
+    fi
+  else
+    read -p "Press Enter to continue anyway (may fail) or Ctrl+C to abort..."
+  fi
+fi
 check_success "Failed to create physical volume"
 
 vgcreate vg_system "$lvm_part"
+if [ $? -ne 0 ]; then
+  log "ERROR: Failed to create volume group"
+  log "Manual intervention required:"
+  log "Try the following commands manually:"
+  log "1. vgremove -f vg_system (if it exists)"
+  log "2. pvremove $lvm_part"
+  log "3. wipefs -a $lvm_part"
+  log "4. pvcreate -ff $lvm_part"
+  log "5. vgcreate vg_system $lvm_part"
+  
+  read -p "Would you like to run these commands now? (y/n): " run_manual_vg
+  if [ "$run_manual_vg" = "y" ]; then
+    log "Attempting to remove existing volume group..."
+    vgremove -f vg_system 2>/dev/null || true
+    log "Attempting to remove existing physical volume..."
+    pvremove "$lvm_part" 2>/dev/null || true
+    log "Running wipefs to clean partition..."
+    wipefs -a "$lvm_part"
+    log "Retrying pvcreate with force flag..."
+    pvcreate -ff "$lvm_part"
+    log "Retrying volume group creation..."
+    vgcreate vg_system "$lvm_part"
+    if [ $? -ne 0 ]; then
+      log "Manual commands failed. You may need to restart the system."
+      read -p "Press Enter to continue or Ctrl+C to abort..."
+    else
+      log "Manual intervention successful. Continuing installation."
+    fi
+  else
+    read -p "Press Enter to continue anyway (may fail) or Ctrl+C to abort..."
+  fi
+fi
 check_success "Failed to create volume group"
 
 # Create logical volumes
