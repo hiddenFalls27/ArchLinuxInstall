@@ -1,0 +1,25 @@
+# Compiled shell scripts
+*.o
+*.so
+*.a
+
+# Temporary files
+*~
+*.swp
+*.tmp
+
+# Logs
+*.log
+logs/
+
+# OS specific files
+.DS_Store
+Thumbs.db
+
+# Editor directories and files
+.idea/
+.vscode/
+*.sublime-*
+
+# Backup files
+*.bak 
